@@ -2,32 +2,34 @@ import sys
 import gym
 import tensorflow as tf
 import numpy as np
+import os
 import random
 import datetime
+import json
 
 """
 Hyper Parameters
 """
 GAMMA = 0.95  # discount factor for target Q
-INITIAL_EPSILON = 0.8  # starting value of epsilon
+INITIAL_EPSILON = 1  # starting value of epsilon
 FINAL_EPSILON = 0.01  # final value of epsilon
 EPSILON_DECAY_STEPS = 100
-REPLAY_SIZE = 10000  # experience replay buffer size
+REPLAY_SIZE = 5000  # experience replay buffer size
 BATCH_SIZE = 128  # size of minibatch
-TEST_FREQUENCY = 20  # How many episodes to run before visualizing test accuracy
+TEST_FREQUENCY = 45  # How many episodes to run before visualizing test accuracy
 SAVE_FREQUENCY = 1000  # How many episodes to run before saving model (unused)
 NUM_EPISODES = 200  # Episode limitation
+MAX_REWARD = 200
 EP_MAX_STEPS = 200  # Step limitation in an episode
 LEARNING_RATE = 0.001
 # The number of test iters (with epsilon set to 0) to run every TEST_FREQUENCY episodes
 NUM_TEST_EPS = 5
-HIDDEN_NODES = [10,6,2]
-OUTPUT_VALUES = 2
+HIDDEN_NODES = [24,16,8]
+DROPOUT_RATE = 0.2
 
 class env_conifg(object):
     iscontinuous = 0
     debug = 1
-
 
 def printd(string, level=1, **kwargs):
     c = env_conifg()
@@ -87,15 +89,15 @@ def get_network(state_dim, action_dim, hidden_nodes=HIDDEN_NODES):
     node_input = state_in
     layers = []
     for i, dim in enumerate(HIDDEN_NODES):
-        if OUTPUT_VALUES == dim: activation = None
-        else: activation = tf.nn.relu
+        activation = tf.nn.relu
         layers.append(tf.contrib.layers.fully_connected(node_input, dim, activation_fn=activation))
+        layers[i] = tf.layers.dropout(layers[i], rate=DROPOUT_RATE)
         node_input = layers[i]
 
-    q_values = layers[-1]
+    q_values = tf.contrib.layers.fully_connected(layers[-1], action_dim, activation_fn=None)
 
     q_selected_action = \
-        tf.reduce_sum(tf.multiply(layers[-1], action_in), reduction_indices=1)
+        tf.reduce_sum(tf.multiply(q_values, action_in), reduction_indices=1)
 
     # TO IMPLEMENT: loss function
     # should only be one line, if target_in is implemented correctly
@@ -104,6 +106,7 @@ def get_network(state_dim, action_dim, hidden_nodes=HIDDEN_NODES):
     optimise_step = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(loss)
 
     train_loss_summary_op = tf.summary.scalar("TrainingLoss", loss)
+
     return state_in, action_in, target_in, q_values, q_selected_action, \
            loss, optimise_step, train_loss_summary_op
 
@@ -239,13 +242,19 @@ def qtrain(env, state_dim, action_dim,
     # the total_reward across all eps
     batch_presentations_count = total_steps = total_reward = 0
 
+    config = env_conifg()
+
+    reached_max = 200
+    printd("Num Episodes {ne}", level=4, ne=num_episodes)
+
     for episode in range(num_episodes):
         # initialize task
         state = env.reset()
         if render: env.render()
 
         # Update epsilon once per episode - exp decaying
-        epsilon -= (epsilon - final_epsilon) / epsilon_decay_steps
+        #epsilon = INITIAL_EPSILON*np.exp(-episode/20)
+        epsilon -= (epsilon - final_epsilon)/epsilon_decay_steps
 
         # in test mode we set epsilon to 0
         test_mode = force_test_mode or \
@@ -272,7 +281,8 @@ def qtrain(env, state_dim, action_dim,
             update_replay_buffer(replay_buffer, state, action, reward,
                                  next_state, done, action_dim)
             state = next_state
-
+            printd("replay_buffer {l}, {lat}", level=4, l=len(replay_buffer), lat=replay_buffer[-1] )
+            printd("Done {d}", level=4, d=done)
             # perform a training step if the replay_buffer has a batch worth of samples
             if (len(replay_buffer) > BATCH_SIZE):
                 do_train_step(replay_buffer, state_in, action_in, target_in,
@@ -282,18 +292,25 @@ def qtrain(env, state_dim, action_dim,
 
             if done:
                 break
+
         total_reward += ep_reward
         test_or_train = "test" if test_mode else "train"
         if test_mode:
-            print("end {tt} episode {ep}, reward: {r} - avg {ar:0.2f}, epsilon: {eps:.2}".format(
-                tt=test_or_train, ep=episode, r=ep_reward, ar=total_reward / (episode + 1), eps=epsilon
-            ))
+            printd("end {tt} episode {ep}, reward: {r} - avg {ar:0.2f}, epsilon: {eps:.2}", level=1, \
+            tt=test_or_train, ep=episode, r=ep_reward, ar=total_reward / (episode + 1), eps=epsilon)
 
+        if all([ep_reward == MAX_REWARD, reached_max == 200]):
+            reached_max = episode
+
+    return { 'details':"G{g}Eps{es:0.2f}Epe{ee:0.2f}Rs{rs}Hn{hn}".format(g=GAMMA, es=epsilon, ee=final_epsilon, rs=REPLAY_SIZE, hn=HIDDEN_NODES), \
+    'avgrew':total_reward / (episode + 1), \
+    'maxrewreach': reached_max,
+    'episodes':NUM_EPISODES}
 
 
 def setup():
     default_env_name = 'CartPole-v0'
-    # default_env_name = 'MountainCar-v0'
+    #default_env_name = 'MountainCar-v0'
     # default_env_name = 'Pendulum-v0'
     # if env_name provided as cmd line arg, then use that
     env_name = sys.argv[1] if len(sys.argv) > 1 else default_env_name
@@ -305,8 +322,31 @@ def setup():
 
 
 def main():
-    env, state_dim, action_dim, network_vars = setup()
-    qtrain(env, state_dim, action_dim, *network_vars, render=False)
+
+    result = []
+    itr = 5
+    for i in range(itr):
+        env, state_dim, action_dim, network_vars = setup()
+        result.append(qtrain(env, state_dim, action_dim, *network_vars, render=False))
+
+    printd("{name}", level=0, name=result[0]['details'])
+    printd("max reward reached {rr} - average {avg}", level=0, rr=[ item['maxrewreach'] for item in result], \
+    avg=np.sum([ item['maxrewreach'] for item in result])/itr)
+    printd('Average Reward {ar}', level=0, ar=np.sum([ item['avgrew'] for item in result])/itr)
+    printd('min/max Average Reward {minr}:{maxr}', level=0, minr=np.min([ item['avgrew'] for item in result]), \
+    maxr=np.max([ item['avgrew'] for item in result]))
+    printd('Total Episodes {te}', level=0, te=np.sum([ item['episodes'] for item in result]) )
+
+    if not os.path.isfile("result.json"):
+        with open('result.json', 'w') as fout:
+            json.dump([result], fout)
+    else:
+        with open('result.json', 'r') as feedjson:
+            feed = json.load(feedjson)
+        feed.append(result)
+
+        with open('result.json', 'w') as fout:
+            json.dump(feed, fout)
 
 
 if __name__ == "__main__":
