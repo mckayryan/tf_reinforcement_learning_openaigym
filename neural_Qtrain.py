@@ -8,26 +8,28 @@ import datetime
 """
 Hyper Parameters
 """
-GAMMA = 0.9  # discount factor for target Q
-INITIAL_EPSILON = 0.6  # starting value of epsilon
-FINAL_EPSILON = 0.1  # final value of epsilon
+GAMMA = 0.95  # discount factor for target Q
+INITIAL_EPSILON = 0.8  # starting value of epsilon
+FINAL_EPSILON = 0.01  # final value of epsilon
 EPSILON_DECAY_STEPS = 100
 REPLAY_SIZE = 10000  # experience replay buffer size
 BATCH_SIZE = 128  # size of minibatch
-TEST_FREQUENCY = 10  # How many episodes to run before visualizing test accuracy
+TEST_FREQUENCY = 20  # How many episodes to run before visualizing test accuracy
 SAVE_FREQUENCY = 1000  # How many episodes to run before saving model (unused)
-NUM_EPISODES = 100  # Episode limitation
+NUM_EPISODES = 200  # Episode limitation
 EP_MAX_STEPS = 200  # Step limitation in an episode
+LEARNING_RATE = 0.001
 # The number of test iters (with epsilon set to 0) to run every TEST_FREQUENCY episodes
-NUM_TEST_EPS = 4
-HIDDEN_NODES = 5
+NUM_TEST_EPS = 5
+HIDDEN_NODES = [10,6,2]
+OUTPUT_VALUES = 2
 
 class env_conifg(object):
     iscontinuous = 0
     debug = 1
 
 
-def printd(string, **kwargs, level=1):
+def printd(string, level=1, **kwargs):
     c = env_conifg()
     if c.debug >= level:
         print(string.format(**kwargs))
@@ -82,16 +84,24 @@ def get_network(state_dim, action_dim, hidden_nodes=HIDDEN_NODES):
     # TO IMPLEMENT: Q network, whose input is state_in, and has action_dim outputs
     # which are the network's esitmation of the Q values for those actions and the
     # input state. The final layer should be assigned to the variable q_values
-    ...
-    q_values = ...
+    node_input = state_in
+    layers = []
+    for i, dim in enumerate(HIDDEN_NODES):
+        if OUTPUT_VALUES == dim: activation = None
+        else: activation = tf.nn.relu
+        layers.append(tf.contrib.layers.fully_connected(node_input, dim, activation_fn=activation))
+        node_input = layers[i]
+
+    q_values = layers[-1]
 
     q_selected_action = \
-        tf.reduce_sum(tf.multiply(q_values, action_in), reduction_indices=1)
+        tf.reduce_sum(tf.multiply(layers[-1], action_in), reduction_indices=1)
 
     # TO IMPLEMENT: loss function
     # should only be one line, if target_in is implemented correctly
-    loss = ...
-    optimise_step = tf.train.AdamOptimizer().minimize(loss)
+    loss = tf.losses.mean_squared_error(target_in, tf.cast(q_selected_action, dtype="float"))
+
+    optimise_step = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(loss)
 
     train_loss_summary_op = tf.summary.scalar("TrainingLoss", loss)
     return state_in, action_in, target_in, q_values, q_selected_action, \
@@ -116,6 +126,7 @@ def get_action(state, state_in, q_values, epsilon, test_mode, action_dim):
         action = random.randint(0, action_dim - 1)
     else:
         action = np.argmax(Q_estimates)
+    printd("{q} -> {a}", level=4, q=Q_estimates, a=action)
     return action
 
 
@@ -138,9 +149,10 @@ def update_replay_buffer(replay_buffer, state, action, reward, next_state, done,
     """
     # TO IMPLEMENT: append to the replay_buffer
     # ensure the action is encoded one hot
-    ...
+    one_hot_action = np.zeros(action_dim)
+    one_hot_action[action] = 1
     # append to buffer
-    replay_buffer.append(...)
+    replay_buffer.append([state, one_hot_action, reward, next_state, done])
     # Ensure replay_buffer doesn't grow larger than REPLAY_SIZE
     if len(replay_buffer) > REPLAY_SIZE:
         replay_buffer.pop(0)
@@ -152,6 +164,9 @@ def do_train_step(replay_buffer, state_in, action_in, target_in,
                   train_loss_summary_op, batch_presentations_count):
     target_batch, state_batch, action_batch = \
         get_train_batch(q_values, state_in, replay_buffer)
+    printd("target_batch {s}", level=2, s=np.asarray(target_batch).shape)
+    printd("state_batch {s}", level=2, s=np.asarray(state_batch).shape)
+    printd("action_batch {s}", level=2, s=np.asarray(action_batch).shape)
 
     summary, _ = session.run([train_loss_summary_op, optimise_step], feed_dict={
         target_in: target_batch,
@@ -181,24 +196,34 @@ def get_train_batch(q_values, state_in, replay_buffer):
     notes here: https://webcms3.cse.unsw.edu.au/COMP9444/17s2/resources/12494
     """
     minibatch = random.sample(replay_buffer, BATCH_SIZE)
+    for i, item in enumerate(np.asarray(replay_buffer[:10])):
+        printd("rb {l}-{s}:{eg}", level=3, l=i, s=len(item), eg=item)
 
-    state_batch = [data[0] for data in minibatch]
-    action_batch = [data[1] for data in minibatch]
-    reward_batch = [data[2] for data in minibatch]
-    next_state_batch = [data[3] for data in minibatch]
+    state_batch = np.asarray([data[0] for data in minibatch])
+    action_batch = np.asarray([data[1] for data in minibatch])
+    reward_batch = np.asarray([data[2] for data in minibatch])
+    next_state_batch = np.asarray([data[3] for data in minibatch])
+
+    printd("state_batch {l}:\n{eg}", level=3, l=len(state_batch), eg=state_batch[:10])
+    printd("action_batch {l}:\n{eg}", level=3, l=len(action_batch), eg=action_batch[:10])
+    printd("reward_batch {l}:\n{eg}", level=3, l=len(reward_batch), eg=reward_batch[:10])
+    printd("next_state_batch {l}:\n{eg}", level=3, l=len(next_state_batch), eg=next_state_batch[:10])
 
     target_batch = []
     Q_value_batch = q_values.eval(feed_dict={
         state_in: next_state_batch
     })
+    printd("Q Values {l}:\n{qv}", level=4, l=len(Q_value_batch), qv=Q_value_batch)
+
     for i in range(0, BATCH_SIZE):
         sample_is_done = minibatch[i][4]
         if sample_is_done:
             target_batch.append(reward_batch[i])
         else:
             # TO IMPLEMENT: set the target_val to the correct Q value update
-            target_val = ...
+            target_val = reward_batch[i] + GAMMA*np.amax(Q_value_batch[i])
             target_batch.append(target_val)
+    printd("targets {t}", level=4, t=target_batch[:10])
     return target_batch, state_batch, action_batch
 
 
@@ -227,7 +252,7 @@ def qtrain(env, state_dim, action_dim,
                     ((episode % test_frequency) < num_test_eps and
                         episode > num_test_eps
                     )
-        if test_mode: print("Test mode (epsilon set to 0.0)")
+        #if test_mode: print("Test mode (epsilon set to 0.0)")
 
         ep_reward = 0
         for step in range(ep_max_steps):
@@ -259,11 +284,11 @@ def qtrain(env, state_dim, action_dim,
                 break
         total_reward += ep_reward
         test_or_train = "test" if test_mode else "train"
-        print("end {0} episode {1}, ep reward: {2}, ave reward: {3}, \
-            Batch presentations: {4}, epsilon: {5}".format(
-            test_or_train, episode, ep_reward, total_reward / (episode + 1),
-            batch_presentations_count, epsilon
-        ))
+        if test_mode:
+            print("end {tt} episode {ep}, reward: {r} - avg {ar:0.2f}, epsilon: {eps:.2}".format(
+                tt=test_or_train, ep=episode, r=ep_reward, ar=total_reward / (episode + 1), eps=epsilon
+            ))
+
 
 
 def setup():
@@ -281,7 +306,7 @@ def setup():
 
 def main():
     env, state_dim, action_dim, network_vars = setup()
-    qtrain(env, state_dim, action_dim, *network_vars, render=True)
+    qtrain(env, state_dim, action_dim, *network_vars, render=False)
 
 
 if __name__ == "__main__":
